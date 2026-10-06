@@ -24,7 +24,7 @@ import { loadSmartConnectionsData, SmartConnectionsData } from './data.js';
 import { toolDefinitions, handleToolCall, ToolContext } from './tools.js';
 import { createEmbedder, Embedder } from './embeddings.js';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 
 /**
  * Main entry point.

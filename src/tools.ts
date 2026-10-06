@@ -5,9 +5,12 @@
  * - search_by_text: Search using freeform text query (computes embedding locally)
  * - search_similar: Find notes similar to an existing note
  * - search_by_embedding: Search using a raw embedding vector
- * - get_note: Get content of a specific note
+ * - get_note: Get content (or one section / a slice) of a specific note
  * - get_model_info: Get embedding model configuration
- * - list_indexed: List all indexed notes
+ * - list_indexed: List indexed notes, paged
+ *
+ * Responses use the compact formats in format.ts by default to keep the
+ * client's context window small; pass format: "json" for structured output.
  */
 
 import * as fs from 'node:fs';
@@ -19,153 +22,148 @@ import {
   validateLimit,
   log,
 } from './security.js';
-import { SmartConnectionsData, extractTitle } from './data.js';
+import { SmartConnectionsData } from './data.js';
 import { findSimilar, findSimilarToNote } from './search.js';
 import { Embedder } from './embeddings.js';
+import {
+  formatSearchResults,
+  formatNoteList,
+  formatNote,
+  stripFrontmatter,
+  extractSection,
+} from './format.js';
 
 // ============================================================================
 // Tool Schemas (Zod)
 // ============================================================================
 
+const FormatSchema = z.enum(['text', 'json']).default('text');
+
 export const SearchSimilarSchema = z.object({
-  notePath: z.string().describe('Path to note relative to vault root (e.g., "Topics/Claude_Code.md")'),
-  limit: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50)'),
-  threshold: z.number().min(0).max(1).default(0.3).describe('Minimum similarity score (0-1)'),
+  notePath: z.string(),
+  limit: z.number().int().min(1).max(50).default(10),
+  threshold: z.number().min(0).max(1).default(0.3),
+  format: FormatSchema,
 });
 
 export const SearchByEmbeddingSchema = z.object({
-  embedding: z.array(z.number()).describe('Embedding vector (must match model dimensions)'),
-  limit: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50)'),
-  threshold: z.number().min(0).max(1).default(0.3).describe('Minimum similarity score (0-1)'),
+  embedding: z.array(z.number()),
+  limit: z.number().int().min(1).max(50).default(10),
+  threshold: z.number().min(0).max(1).default(0.3),
+  format: FormatSchema,
 });
 
 export const GetNoteSchema = z.object({
-  notePath: z.string().describe('Path to note relative to vault root'),
+  notePath: z.string(),
+  section: z.string().min(1).max(200).optional(),
+  stripFrontmatter: z.boolean().default(false),
+  offset: z.number().int().min(0).default(0),
+  maxLength: z.number().int().min(1).optional(),
+  format: FormatSchema,
 });
 
 export const ListIndexedSchema = z.object({
-  pattern: z.string().optional().describe('Filter by path prefix (e.g., "Topics/")'),
+  pattern: z.string().optional(),
+  limit: z.number().int().min(1).max(1000).default(200),
+  offset: z.number().int().min(0).default(0),
+  format: FormatSchema,
 });
 
 export const SearchByTextSchema = z.object({
-  query: z.string().min(1).max(500).describe('Text to search for (max 500 characters)'),
-  limit: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50)'),
-  threshold: z.number().min(0).max(1).default(0.3).describe('Minimum similarity score (0-1)'),
+  query: z.string().min(1).max(500),
+  limit: z.number().int().min(1).max(50).default(10),
+  threshold: z.number().min(0).max(1).default(0.3),
+  format: FormatSchema,
 });
 
 // ============================================================================
 // Tool Definitions (for MCP registration)
 // ============================================================================
 
+// Tool definitions are sent to the client on every session and usually sit in
+// the model's context for the whole conversation, so descriptions are kept
+// terse and shared properties are defined once.
+
+const formatProp = { type: 'string', enum: ['text', 'json'] };
+
+const searchProps = {
+  limit: { type: 'integer', description: '1-50, def 10' },
+  threshold: { type: 'number', description: '0-1, def 0.3' },
+  format: formatProp,
+};
+
 export const toolDefinitions = [
   {
     name: 'search_by_text',
-    description: 'Search for notes using freeform text. Computes embedding locally using the same model as Smart Connections, then finds semantically similar notes.',
+    description: 'Semantic search by text. Returns score<TAB>path lines.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        query: {
-          type: 'string',
-          description: 'Text to search for (max 500 characters)',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum results to return (1-50, default: 10)',
-          default: 10,
-        },
-        threshold: {
-          type: 'number',
-          description: 'Minimum similarity score (0-1, default: 0.3)',
-          default: 0.3,
-        },
+        query: { type: 'string', description: 'Max 500 chars' },
+        ...searchProps,
       },
       required: ['query'],
     },
   },
   {
     name: 'search_similar',
-    description: 'Find notes semantically similar to an existing note in your vault',
+    description: 'Notes similar to a note.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        notePath: {
-          type: 'string',
-          description: 'Path to note relative to vault root (e.g., "Topics/Claude_Code.md")',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum results to return (1-50, default: 10)',
-          default: 10,
-        },
-        threshold: {
-          type: 'number',
-          description: 'Minimum similarity score (0-1, default: 0.3)',
-          default: 0.3,
-        },
+        notePath: { type: 'string', description: 'e.g. "Topics/Foo.md"' },
+        ...searchProps,
       },
       required: ['notePath'],
     },
   },
   {
     name: 'search_by_embedding',
-    description: 'Find notes similar to a provided embedding vector',
+    description: 'Notes similar to a vector.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        embedding: {
-          type: 'array',
-          items: { type: 'number' },
-          description: 'Embedding vector (must match model dimensions)',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum results to return (1-50, default: 10)',
-          default: 10,
-        },
-        threshold: {
-          type: 'number',
-          description: 'Minimum similarity score (0-1, default: 0.3)',
-          default: 0.3,
-        },
+        embedding: { type: 'array', items: { type: 'number' } },
+        ...searchProps,
       },
       required: ['embedding'],
     },
   },
   {
     name: 'get_note',
-    description: 'Retrieve the content of a specific note from the vault',
+    description: 'Read a note. Prefer section/maxLength over whole notes; page with offset.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        notePath: {
-          type: 'string',
-          description: 'Path to note relative to vault root',
-        },
+        notePath: { type: 'string' },
+        section: { type: 'string', description: 'Heading text' },
+        stripFrontmatter: { type: 'boolean' },
+        offset: { type: 'integer' },
+        maxLength: { type: 'integer', description: 'Chars, max 10240' },
+        format: formatProp,
       },
       required: ['notePath'],
     },
   },
   {
     name: 'get_model_info',
-    description: 'Get information about the embedding model used by this vault',
+    description: 'Embedding model info.',
     inputSchema: {
       type: 'object' as const,
       properties: {},
-      required: [],
     },
   },
   {
     name: 'list_indexed',
-    description: 'List all notes that have been indexed with embeddings',
+    description: 'List indexed note paths.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        pattern: {
-          type: 'string',
-          description: 'Optional path prefix filter (e.g., "Topics/")',
-        },
+        pattern: { type: 'string', description: 'Path prefix' },
+        limit: { type: 'integer', description: '1-1000, def 200' },
+        offset: { type: 'integer' },
+        format: formatProp,
       },
-      required: [],
     },
   },
 ];
@@ -197,7 +195,7 @@ export function handleSearchSimilar(
     return errorResult(`Invalid arguments: ${parsed.error.message}`);
   }
 
-  const { notePath, limit, threshold } = parsed.data;
+  const { notePath, limit, threshold, format } = parsed.data;
 
   // Validate the note path exists in index (no filesystem access needed for search)
   const normalizedPath = notePath.replace(/^\/+/, '');
@@ -216,10 +214,7 @@ export function handleSearchSimilar(
 
   log('INFO', 'search_similar', { notePath, resultCount: results.length });
 
-  return successResult({
-    query: notePath,
-    results,
-  });
+  return textResult(formatSearchResults(results, format, notePath));
 }
 
 /**
@@ -234,7 +229,7 @@ export function handleSearchByEmbedding(
     return errorResult(`Invalid arguments: ${parsed.error.message}`);
   }
 
-  const { embedding, limit, threshold } = parsed.data;
+  const { embedding, limit, threshold, format } = parsed.data;
 
   // Validate embedding dimensions
   const validation = validateEmbedding(embedding, ctx.data.modelInfo.dimensions);
@@ -249,9 +244,7 @@ export function handleSearchByEmbedding(
 
   log('INFO', 'search_by_embedding', { resultCount: results.length });
 
-  return successResult({
-    results,
-  });
+  return textResult(formatSearchResults(results, format));
 }
 
 /**
@@ -274,7 +267,7 @@ export async function handleSearchByText(
     return errorResult(`Invalid arguments: ${parsed.error.message}`);
   }
 
-  const { query, limit, threshold } = parsed.data;
+  const { query, limit, threshold, format } = parsed.data;
 
   // Compute embedding for the query text
   let embedding: number[];
@@ -294,10 +287,7 @@ export async function handleSearchByText(
 
   log('INFO', 'search_by_text', { queryLength: query.length, resultCount: results.length });
 
-  return successResult({
-    query,
-    results,
-  });
+  return textResult(formatSearchResults(results, format, query));
 }
 
 /**
@@ -314,7 +304,7 @@ export function handleGetNote(
     return errorResult(`Invalid arguments: ${parsed.error.message}`);
   }
 
-  const { notePath } = parsed.data;
+  const { notePath, section, offset, format } = parsed.data;
 
   // SECURITY: Validate path before any filesystem access
   const validation = validateNotePath(ctx.config, notePath);
@@ -331,19 +321,27 @@ export function handleGetNote(
     return errorResult('Failed to read note');
   }
 
-  // SECURITY: Enforce content length limit
-  if (content.length > ctx.config.limits.maxContentLength) {
-    content = content.slice(0, ctx.config.limits.maxContentLength);
-    content += '\n\n[Content truncated - exceeded maximum length]';
+  if (parsed.data.stripFrontmatter) {
+    content = stripFrontmatter(content);
   }
 
-  log('INFO', 'get_note', { notePath, contentLength: content.length });
+  if (section !== undefined) {
+    const extracted = extractSection(content, section);
+    if (extracted === null) {
+      return errorResult(`Section not found: ${section}`);
+    }
+    content = extracted;
+  }
 
-  return successResult({
-    path: notePath,
-    title: extractTitle(notePath),
-    content,
-  });
+  // SECURITY: Enforce content length limit (caller may only lower it)
+  const cap = ctx.config.limits.maxContentLength;
+  const maxLength = Math.min(parsed.data.maxLength ?? cap, cap);
+  const total = content.length;
+  const slice = content.slice(offset, offset + maxLength);
+
+  log('INFO', 'get_note', { notePath, offset, returnedLength: slice.length, total });
+
+  return textResult(formatNote({ path: notePath, content: slice, offset, total }, format));
 }
 
 /**
@@ -353,11 +351,11 @@ export function handleGetModelInfo(
   _args: unknown,
   ctx: ToolContext
 ): ToolResult {
-  return successResult({
+  return textResult(JSON.stringify({
     modelKey: ctx.data.modelInfo.modelKey,
     dimensions: ctx.data.modelInfo.dimensions,
     adapter: ctx.data.modelInfo.adapter,
-  });
+  }));
 }
 
 /**
@@ -372,38 +370,30 @@ export function handleListIndexed(
     return errorResult(`Invalid arguments: ${parsed.error.message}`);
   }
 
-  const { pattern } = parsed.data;
+  const { pattern, limit, offset, format } = parsed.data;
 
-  const notes: Array<{ path: string; title: string }> = [];
-
-  for (const [notePath] of ctx.data.entries) {
-    // Apply pattern filter if provided
+  const paths: string[] = [];
+  for (const notePath of ctx.data.entries.keys()) {
     if (pattern && !notePath.startsWith(pattern)) {
       continue;
     }
-
-    notes.push({
-      path: notePath,
-      title: extractTitle(notePath),
-    });
+    paths.push(notePath);
   }
 
-  // Sort alphabetically by path
-  notes.sort((a, b) => a.path.localeCompare(b.path));
+  // Sort alphabetically so offsets are stable between calls
+  paths.sort((a, b) => a.localeCompare(b));
 
-  return successResult({
-    count: notes.length,
-    notes,
-  });
+  const page = paths.slice(offset, offset + limit);
+  return textResult(formatNoteList(page, paths.length, offset, format));
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-function successResult(data: unknown): ToolResult {
+function textResult(text: string): ToolResult {
   return {
-    content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+    content: [{ type: 'text', text }],
   };
 }
 
