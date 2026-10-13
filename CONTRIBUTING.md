@@ -30,7 +30,7 @@ This is a security-focused project. Before submitting changes:
 Before submitting:
 
 ```bash
-npm run build
+npm test
 # Test manually with your vault
 VAULT_PATH=/path/to/vault node dist/index.js
 ```

@@ -23,6 +23,7 @@ This implementation:
 ## Features
 
 - **Text search** - query with plain text, not just note paths
+- **Token-efficient** - compact responses, section-level reads, paging (see below)
 - **Semantic search** using Smart Connections embeddings
 - **Local inference** - uses Transformers.js (same model as Smart Connections)
 - **Read-only** - no write operations, no shell execution
@@ -124,9 +125,27 @@ Once configured, Claude Code can use these tools:
 | `search_by_text` | Search using freeform text (computes embedding locally) |
 | `search_similar` | Find notes semantically similar to a given note |
 | `search_by_embedding` | Search using a raw embedding vector |
-| `get_note` | Get content of a specific note (path validated) |
+| `get_note` | Get content of a specific note (path validated); supports `section`, `stripFrontmatter`, `offset`, `maxLength` |
 | `get_model_info` | Get embedding model configuration |
-| `list_indexed` | List all indexed notes |
+| `list_indexed` | List indexed notes, paged with `limit` (default 200) / `offset` |
+
+## Token Efficiency
+
+Everything a tool returns ends up in the model's context window, so responses are kept lean by default:
+
+| Technique | Effect |
+|-----------|--------|
+| Plain-text results (`score<TAB>path` per line) instead of pretty-printed JSON | Search responses ~67% smaller |
+| `list_indexed` paged at 200 by default, with a `next offset=` hint | Listing a 500-note vault: ~85% smaller |
+| `get_note` `section` (one heading and its subsections) + `stripFrontmatter` | Reading one section of a long note: ~89% smaller |
+| Note content returned raw, not JSON-escaped | No `\n` / `\"` overhead |
+| Terse tool descriptions with shared parameter definitions | Tool list ~9% smaller than v0.2.0 even with the new parameters |
+
+Long notes come back in slices with a trailer like `[truncated: chars 0-10240 of 25000; next offset=10240]`, so the client can page through deliberately instead of guessing.
+
+Every tool except `get_model_info` takes `format: "json"` for structured (minified) output. Search results in JSON keep the v0.2.0 shape (`path`, `title`, `score`).
+
+> **Upgrading from 0.2.x:** the default response format is now `text`. Pass `format: "json"` if you parse responses programmatically. `list_indexed` now returns at most 200 paths per call unless you raise `limit`.
 
 ## Configuration
 
@@ -146,6 +165,9 @@ Once configured, Claude Code can use these tools:
 ```bash
 # Build
 npm run build
+
+# Build and run tests (node:test, no extra dependencies)
+npm test
 
 # Test with MCP Inspector
 npx @modelcontextprotocol/inspector node dist/index.js
