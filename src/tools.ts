@@ -31,6 +31,7 @@ import {
   formatNote,
   stripFrontmatter,
   extractSection,
+  sliceNote,
 } from './format.js';
 
 // ============================================================================
@@ -337,11 +338,11 @@ export function handleGetNote(
   const cap = ctx.config.limits.maxContentLength;
   const maxLength = Math.min(parsed.data.maxLength ?? cap, cap);
   const total = content.length;
-  const slice = content.slice(offset, offset + maxLength);
+  const slice = sliceNote(content, offset, maxLength);
 
-  log('INFO', 'get_note', { notePath, offset, returnedLength: slice.length, total });
+  log('INFO', 'get_note', { notePath, offset: slice.offset, returnedLength: slice.content.length, total });
 
-  return textResult(formatNote({ path: notePath, content: slice, offset, total }, format));
+  return textResult(formatNote({ path: notePath, ...slice, total }, format));
 }
 
 /**
