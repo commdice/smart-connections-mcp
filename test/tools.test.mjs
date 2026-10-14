@@ -8,7 +8,7 @@ import * as path from 'node:path';
 import { validateConfig } from '../dist/security.js';
 import { loadSmartConnectionsData } from '../dist/data.js';
 import { handleToolCall, toolDefinitions } from '../dist/tools.js';
-import { stripFrontmatter, extractSection } from '../dist/format.js';
+import { stripFrontmatter, extractSection, sliceNote } from '../dist/format.js';
 
 const DIMS = 384;
 let vault;
@@ -143,4 +143,29 @@ test('extractSection returns null when absent', () => {
 test('tool definitions are no larger than v0.2.0 (2194 chars)', () => {
   const size = JSON.stringify(toolDefinitions).length;
   assert.ok(size <= 2194, `tool definitions are ${size} chars`);
+});
+
+test('extractSection only closes a fence with the marker that opened it', () => {
+  const md = '# A\n\n```\n~~~\n# not a heading\n```\n\nstill A\n\n# B\nmore';
+  assert.equal(extractSection(md, 'A'), '# A\n\n```\n~~~\n# not a heading\n```\n\nstill A');
+  assert.equal(extractSection(md, 'not a heading'), null);
+  const longFence = '# A\n````\n```\n# inside\n````\n# B';
+  assert.equal(extractSection(longFence, 'inside'), null);
+  assert.equal(extractSection(longFence, 'B'), '# B');
+});
+
+test('get_note reports an offset past the end instead of returning nothing', async () => {
+  const out = await text('get_note', { notePath: 'Shop/Big.md', offset: 30000 });
+  assert.equal(out, '[offset 30000 is past the end; note is 25000 chars]');
+  const json = JSON.parse(await text('get_note', { notePath: 'Shop/Big.md', offset: 30000, format: 'json' }));
+  assert.deepEqual(json, { path: 'Shop/Big.md', content: '', offset: 30000, total: 25000 });
+});
+
+test('sliceNote never splits a surrogate pair', () => {
+  const s = 'ab\u{1F3A8}cd'; // 'ab' + 2 code units + 'cd'
+  assert.deepEqual(sliceNote(s, 0, 3), { content: 'ab', offset: 0 });
+  assert.deepEqual(sliceNote(s, 3, 2), { content: '\u{1F3A8}', offset: 2 });
+  // A 1-char budget on a pair returns the whole pair rather than an empty slice
+  assert.deepEqual(sliceNote(s, 2, 1), { content: '\u{1F3A8}', offset: 2 });
+  assert.deepEqual(sliceNote(s, 0, 100), { content: s, offset: 0 });
 });

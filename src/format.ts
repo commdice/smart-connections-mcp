@@ -105,10 +105,48 @@ export function formatNote(slice: NoteSlice, format: OutputFormat): string {
     });
   }
 
+  if (slice.offset > 0 && slice.offset >= slice.total) {
+    return `[offset ${slice.offset} is past the end; note is ${slice.total} chars]`;
+  }
   if (nextOffset === undefined) {
     return slice.content;
   }
   return `${slice.content}\n\n[truncated: chars ${slice.offset}-${end} of ${slice.total}; next offset=${nextOffset}]`;
+}
+
+/**
+ * Take up to maxLength UTF-16 code units of content starting at offset,
+ * without splitting a surrogate pair at either edge (a split pair becomes a
+ * replacement character in the client). Returns the actual start offset.
+ */
+export function sliceNote(
+  content: string,
+  offset: number,
+  maxLength: number
+): { content: string; offset: number } {
+  let start = offset;
+  if (start > 0 && start < content.length && isLowSurrogate(content, start) && isHighSurrogate(content, start - 1)) {
+    start--;
+  }
+
+  let end = Math.min(start + maxLength, content.length);
+  if (end < content.length && isHighSurrogate(content, end - 1) && isLowSurrogate(content, end)) {
+    // Back off one unit, unless that would leave nothing to return (a client
+    // paging with maxLength 1 would otherwise never advance).
+    end = end - 1 > start ? end - 1 : end + 1;
+  }
+
+  return { content: content.slice(start, end), offset: start };
+}
+
+function isHighSurrogate(s: string, i: number): boolean {
+  const c = s.charCodeAt(i);
+  return c >= 0xd800 && c <= 0xdbff;
+}
+
+function isLowSurrogate(s: string, i: number): boolean {
+  const c = s.charCodeAt(i);
+  return c >= 0xdc00 && c <= 0xdfff;
 }
 
 /**
@@ -130,17 +168,25 @@ export function extractSection(content: string, heading: string): string | null 
   const wanted = heading.trim().replace(/^#+\s*/, '').toLowerCase();
   const lines = content.split('\n');
 
-  let inFence = false;
+  // The fence that opened the current code block ('' when outside one). Only a
+  // fence of the same character and at least the same length closes it.
+  let openFence = '';
   let start = -1;
   let level = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^\s*(```|~~~)/.test(line)) {
-      inFence = !inFence;
+    const fence = /^\s*(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      const marker = fence[1];
+      if (!openFence) {
+        openFence = marker;
+      } else if (marker[0] === openFence[0] && marker.length >= openFence.length) {
+        openFence = '';
+      }
       continue;
     }
-    if (inFence) continue;
+    if (openFence) continue;
 
     const m = /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
     if (!m) continue;
